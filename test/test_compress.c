@@ -10,8 +10,9 @@
 #endif
 
 void vli_print(char *str, uint8_t *vli, unsigned int size) {
+    unsigned i;
     printf("%s ", str);
-    for(unsigned i=0; i<size; ++i) {
+    for(i=0; i<size; ++i) {
         printf("%02X ", (unsigned)vli[i]);
     }
     printf("\n");

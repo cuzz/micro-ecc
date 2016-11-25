@@ -6,7 +6,8 @@
 #include <string.h>
 
 void vli_print(uint8_t *vli, unsigned int size) {
-    for(unsigned i=0; i<size; ++i) {
+    unsigned i;
+    for(i=0; i<size; ++i) {
         printf("%02X ", (unsigned)vli[i]);
     }
 }

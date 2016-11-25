@@ -3,7 +3,12 @@
 #ifndef _UECC_H_
 #define _UECC_H_
 
+#if defined(_MSC_VER) && (_MSC_VER < 1600)
+//#error ¡°only visual c++ 2010 and above supported.¡±
+#include "vc.stdint.h"
+#else
 #include <stdint.h>
+#endif
 
 /* Platform selection options.
 If uECC_PLATFORM is not defined, the code will try to guess it based on compiler macros.
