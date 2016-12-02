@@ -1,4 +1,4 @@
-/* Copyright 2014, Kenneth MacKay. Licensed under the BSD 2-clause license. */
+﻿/* Copyright 2014, Kenneth MacKay. Licensed under the BSD 2-clause license. */
 
 #include "uECC.h"
 #include "uECC_vli.h"
@@ -1311,6 +1311,12 @@ int uECC_sign(const uint8_t *private_key,
     uECC_word_t k[uECC_MAX_WORDS];
     uECC_word_t tries;
 
+	//SM2
+	if(curve->double_jacobian == double_jacobian_SM2)
+	{
+		return SM2_sign(private_key,message_hash,hash_size,signature,curve);
+	}
+
     for (tries = 0; tries < uECC_RNG_MAX_TRIES; ++tries) {
         if (!uECC_generate_random_int(k, curve->n, BITS_TO_WORDS(curve->num_n_bits))) {
             return 0;
@@ -1492,6 +1498,12 @@ int uECC_verify(const uint8_t *public_key,
     uECC_vli_bytesToNative(s, signature + curve->num_bytes, curve->num_bytes);
 #endif
 
+	//SM2
+	if(curve->double_jacobian == double_jacobian_SM2)
+	{
+		return SM2_verify(public_key,message_hash,hash_size,signature,curve);
+	}
+
     /* r, s must not be 0. */
     if (uECC_vli_isZero(r, num_words) || uECC_vli_isZero(s, num_words)) {
         return 0;
@@ -1632,3 +1644,376 @@ void uECC_point_mult(uECC_word_t *result,
 }
 
 #endif /* uECC_ENABLE_VLI_API */
+
+// --------------- SM2 -------------
+
+#if uECC_SUPPORTS_SM2
+
+#ifdef SM2_TEST_DATA
+static void hexstr_to_bytes(uint8_t* bytes,char* hex_str)
+{
+	char* p=hex_str;
+	uint8_t* d= bytes;
+	char high,low;
+	while(*p!=0)
+	{
+		int val=0;
+
+		while(*p==' ')
+			p++;
+
+		high=toupper(*p);
+
+		p++;
+		while(*p==' ')
+			p++;
+
+		low=toupper(*(p));
+
+		if(high>'9')
+			val+= (high-'A'+10 )*16;
+		else
+			val+= (high-'0')*16;
+		 
+		if(low>'9')
+			val+= low-'A'+10 ;
+		else
+			val+= low-'0';
+
+		*d=val;
+
+		d++;
+		p++;
+	}
+}
+#endif
+
+static void SM2_Point_Add(uECC_word_t * result,
+                          const uECC_word_t * point1,
+                          const uECC_word_t * point2,
+						  struct uECC_Curve_t * curve) 
+{
+    uECC_word_t _2[uECC_MAX_WORDS]=    
+	  { BYTES_TO_WORDS_8(03, 00, 00, 00, 00, 00, 00, 00),
+        BYTES_TO_WORDS_8(00, 00, 00, 00, 00, 00, 00, 00),
+        BYTES_TO_WORDS_8(00, 00, 00, 00, 00, 00, 00, 00),
+        BYTES_TO_WORDS_8(00, 00, 00, 00, 00, 00, 00, 00) }; // 2
+
+    uECC_word_t _3[uECC_MAX_WORDS]=    
+	  { BYTES_TO_WORDS_8(03, 00, 00, 00, 00, 00, 00, 00),
+        BYTES_TO_WORDS_8(00, 00, 00, 00, 00, 00, 00, 00),
+        BYTES_TO_WORDS_8(00, 00, 00, 00, 00, 00, 00, 00),
+        BYTES_TO_WORDS_8(00, 00, 00, 00, 00, 00, 00, 00) }; // 3
+
+	uECC_word_t gamma[uECC_MAX_WORDS];
+	uECC_word_t tmp[uECC_MAX_WORDS];
+	uECC_word_t x1[uECC_MAX_WORDS];
+	uECC_word_t y1[uECC_MAX_WORDS];
+	uECC_word_t x2[uECC_MAX_WORDS];
+	uECC_word_t y2[uECC_MAX_WORDS];
+
+	uECC_vli_set(x1, point1, curve->num_words);
+    uECC_vli_set(y1, point1 + curve->num_words, curve->num_words);
+
+	uECC_vli_set(x2, point2, curve->num_words);
+    uECC_vli_set(y2, point2 + curve->num_words, curve->num_words);
+
+	//x1==x2
+	if( uECC_vli_equal(x1, x2, curve->num_words) )
+	{
+		// gamma = (3x1^2 +a )/ 2y1   (mod p)
+		uECC_word_t gamma[uECC_MAX_WORDS];
+		uECC_word_t tmp[uECC_MAX_WORDS];
+		uECC_word_t x[uECC_MAX_WORDS];
+		uECC_word_t y[uECC_MAX_WORDS];
+
+		uECC_vli_modMult(gamma,x1, x1 ,curve->p,  curve->num_words);  // x1^2	
+		uECC_vli_modMult(gamma,gamma, _3 ,curve->p,  curve->num_words);  // 3* x1^2
+		uECC_vli_modAdd(gamma,gamma, _uECC_SM2_curve_a ,curve->p,  curve->num_words); // 3* x1^2 +a
+
+		uECC_vli_modMult(tmp, y1 , _2 ,curve->p,  curve->num_words);   //2y
+		uECC_vli_modInv(tmp, tmp  ,curve->p,  curve->num_words);   // 1/2y
+
+		uECC_vli_modMult(gamma,gamma, tmp ,curve->p,  curve->num_words);
+
+		// x3 = gamma^2 - 2x1 (mod p)
+		uECC_vli_modMult(tmp, gamma, gamma, curve->p,  curve->num_words);
+		uECC_vli_modSub(tmp, tmp, x1 ,curve->p,  curve->num_words);
+		uECC_vli_modSub(result,tmp, x1 ,curve->p,  curve->num_words);
+
+		//y3= gamma*(x1 - x3) -y1 (mod p)
+		uECC_vli_modSub(tmp,x1, result ,curve->p,  curve->num_words);
+		uECC_vli_modMult(tmp, gamma, tmp ,curve->p,  curve->num_words);
+		uECC_vli_modSub(result+curve->num_words, tmp, y1 ,curve->p,  curve->num_words);
+	}
+	else
+	{
+		// gamma = (y2-y1 )/(x2-x1)  (mod p)
+		uECC_vli_modSub(tmp, x2, x1 ,curve->p,  curve->num_words);
+		uECC_vli_modInv(tmp, tmp  ,curve->p,  curve->num_words);   // 1/(x2-x1)
+
+		uECC_vli_modSub(gamma, y2, y1 ,curve->p,  curve->num_words); // y2-y1
+		uECC_vli_modMult(gamma, gamma ,tmp ,curve->p,  curve->num_words);   
+ 
+		// x3 = gamma^2  -x1 -x2 (mod p)
+		uECC_vli_modMult(tmp, gamma ,gamma ,curve->p,  curve->num_words);  // gamma^2 
+		uECC_vli_modSub(tmp,tmp, x1  ,curve->p,  curve->num_words);   // gamma^2 -x1
+		uECC_vli_modSub(result,tmp, x2  ,curve->p,  curve->num_words);   // gamma^2 -x1-x2
+
+		// y3 =gamma (x1 − x3) − y1 (mod p), 
+		uECC_vli_modSub(tmp,x1, result ,curve->p,  curve->num_words);   // x1-x3
+		uECC_vli_modMult(tmp, gamma, tmp ,curve->p,  curve->num_words);
+		uECC_vli_modSub(result+curve->num_words, tmp , y1 ,curve->p,  curve->num_words);   //  
+	}
+}
+
+static int SM2_sign_with_k(const uint8_t *private_key,
+                            const uint8_t *message_hash,   //Hv
+                            unsigned hash_size,
+                            uECC_word_t *k,
+                            uint8_t *signature,
+                            struct uECC_Curve_t * curve) {
+
+    uECC_word_t tmp[uECC_MAX_WORDS];
+    uECC_word_t tmp2[uECC_MAX_WORDS];
+    uECC_word_t d[uECC_MAX_WORDS];
+    uECC_word_t one[uECC_MAX_WORDS]=    
+	  { BYTES_TO_WORDS_8(01, 00, 00, 00, 00, 00, 00, 00),
+        BYTES_TO_WORDS_8(00, 00, 00, 00, 00, 00, 00, 00),
+        BYTES_TO_WORDS_8(00, 00, 00, 00, 00, 00, 00, 00),
+        BYTES_TO_WORDS_8(00, 00, 00, 00, 00, 00, 00, 00) }; /* 1 */
+    uECC_word_t e[uECC_MAX_WORDS];
+    uECC_word_t r[uECC_MAX_WORDS];
+    uECC_word_t s[uECC_MAX_WORDS];
+	uECC_word_t *k2[2] = {tmp, s};
+#if uECC_VLI_NATIVE_LITTLE_ENDIAN
+    uECC_word_t *p = (uECC_word_t *)signature;
+#else
+    uECC_word_t p[uECC_MAX_WORDS * 2];
+#endif
+    uECC_word_t carry;
+    wordcount_t num_words = curve->num_words;
+    wordcount_t num_n_words = BITS_TO_WORDS(curve->num_n_bits);
+    bitcount_t num_n_bits = curve->num_n_bits;
+
+	uint8_t test_k[256];
+	uint8_t test_e[256];
+	uint8_t test_x[256];
+	uint8_t test_y[256];
+	uint8_t test_priv[256];
+	/*
+		密码杂凑函数值e=H256(M)：
+		B524F552 CD82B8B0 28476E00 5C377FB1 9A87E6FC 682D48BB 5D42E3D9 B9EFFE76
+		产生随机数k：
+		6CB28D99 385C175C 94F94E93 4817663F C176D925 DD72B727 260DBAAE 1FB2F96F
+		计算椭圆曲线点(x1,y1)=[k]G：
+		坐标x1：
+		110FCDA5 7615705D 5E7B9324 AC4B856D 23E6D918 8B2AE477 59514657 CE25D112
+		坐标y1：
+		1C65D68A 4A08601D F24B431E 0CAB4EBE 084772B3 817E8581 1A8510B2 DF7ECA1A
+		计算r=(e+x1)
+	*
+
+
+	//A3: 发生器产生随机数k ∈[1,n-1]；
+    /* Make sure 0 < k < curve_n */
+    if (uECC_vli_isZero(k, num_words) || uECC_vli_cmp(curve->n, k, num_n_words) != 1) {
+        return 0;
+    }
+
+	//A2：计算e = Hv(M)
+	bits2int(e, message_hash, hash_size, curve);
+	
+#ifdef SM2_TEST_DATA
+	hexstr_to_bytes(test_e,"B524F552 CD82B8B0 28476E00 5C377FB1 9A87E6FC 682D48BB 5D42E3D9 B9EFFE76");
+	hexstr_to_bytes(test_k,"6CB28D99 385C175C 94F94E93 4817663F C176D925 DD72B727 260DBAAE 1FB2F96F");
+ 	uECC_vli_bytesToNative(e, test_e, BITS_TO_BYTES(curve->num_n_bits)); 
+	uECC_vli_bytesToNative(k, test_k, BITS_TO_BYTES(curve->num_n_bits));
+#endif
+
+ 	// A4：计算椭圆曲线点(x1,y1)=[k]G
+    carry = regularize_k(k, tmp, s, curve);
+	EccPoint_mult(p, curve->G, k2[!carry], 0, num_n_bits + 1, curve);
+
+	//A5：计算r=(e+x1) mod n，若r=0或r+k=n则返回A3；
+    uECC_vli_modAdd(r, e, p , curve->n, num_n_words);
+
+    if (uECC_vli_isZero(r, num_words)) {
+        return 0;
+    }
+
+	uECC_vli_add(tmp,r,k,num_words);  //r+k
+    if (uECC_vli_cmp(tmp, curve->n, num_n_words) == 0) {
+        return 0;
+    }
+
+	//A6：计算s = ((1 + d)^1 * (k - r*d)) modn，若s=0则返回A3；
+#if uECC_VLI_NATIVE_LITTLE_ENDIAN
+    bcopy((uint8_t *) d, private_key, BITS_TO_BYTES(curve->num_n_bits));
+#else
+    uECC_vli_bytesToNative(d, private_key, BITS_TO_BYTES(curve->num_n_bits)); /* tmp = d */
+#endif
+	
+#ifdef SM2_TEST_DATA
+ 	hexstr_to_bytes(test_priv,"128B2FA8 BD433C6C 068C8D80 3DFF7979 2A519A55 171B1B65 0C23661D 15897263");
+	uECC_vli_bytesToNative(d, test_priv, BITS_TO_BYTES(curve->num_n_bits)); 
+#endif
+
+	uECC_vli_add(tmp,one ,d ,num_words);  //  1+d
+	uECC_vli_modInv(tmp, tmp , curve->n, num_n_words);  // tmp=(1+d)^1
+
+	uECC_vli_modMult(tmp2, r, d, curve->n, num_n_words);  // r*d
+	uECC_vli_modSub(tmp2, k, tmp2, curve->n, num_n_words);  // k-r*d
+
+	uECC_vli_modMult(s,tmp, tmp2, curve->n, num_n_words);	//s= ((1 + d)^1 * (k - r*d)) mod n
+ 
+	if (uECC_vli_isZero(s, num_words)) {
+        return 0;
+    }
+
+#if uECC_VLI_NATIVE_LITTLE_ENDIAN
+    bcopy((uint8_t *) signature, (uint8_t *) r, curve->num_bytes);
+    bcopy((uint8_t *) signature + curve->num_bytes, (uint8_t *) s, curve->num_bytes);
+#else
+    uECC_vli_nativeToBytes(signature, curve->num_bytes, r);
+    uECC_vli_nativeToBytes(signature + curve->num_bytes, curve->num_bytes, s);
+#endif    
+    return 1;
+}
+
+static int SM2_sign(const uint8_t *private_key,
+              const uint8_t *message_hash,
+              unsigned hash_size,
+              uint8_t *signature,
+              struct uECC_Curve_t * curve) {
+    uECC_word_t k[uECC_MAX_WORDS];
+    uECC_word_t tries;
+
+    for (tries = 0; tries < uECC_RNG_MAX_TRIES; ++tries) {
+
+		//1.产生一个随机数k
+        if (!uECC_generate_random_int(k, curve->n, BITS_TO_WORDS(curve->num_n_bits))) {
+            return 0;
+        }
+
+		//2.利用随机数k，计算出两个大数r和s。将r和s拼在一起就构成了对消息摘要的签名。
+		/*
+			r=fx(R),  R=kG.   fx为取点x坐标
+			s= k^-1 ( hash + priv * r ) mod n
+		*/
+
+		if (SM2_sign_with_k(private_key, message_hash, hash_size, k, signature, curve)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/*
+为了检验收到的消息M′及其数字签名(r′, s′)，作为验证者的用户B应实现以下运算步骤：
+B1：检验r′ ∈[1,n-1]是否成立，若不成立则验证不通过；
+B2：检验s′ ∈[1,n-1]是否成立，若不成立则验证不通过；
+
+*/
+static int SM2_verify(const uint8_t *public_key,
+                const uint8_t *message_hash,
+                unsigned hash_size,
+                const uint8_t *signature,
+                struct uECC_Curve_t * curve) {
+    uECC_word_t z[uECC_MAX_WORDS];
+	uECC_word_t u1[uECC_MAX_WORDS]={0x01}, u2[uECC_MAX_WORDS]={0x01};
+    uECC_word_t sum[uECC_MAX_WORDS * 2];
+    uECC_word_t rx[uECC_MAX_WORDS];
+    uECC_word_t ry[uECC_MAX_WORDS];
+    uECC_word_t tx[uECC_MAX_WORDS];
+    uECC_word_t ty[uECC_MAX_WORDS];
+    uECC_word_t tz[uECC_MAX_WORDS];
+    const uECC_word_t *points[4];
+    const uECC_word_t *point;
+    bitcount_t num_bits;
+    bitcount_t i;
+	uECC_word_t tmp[uECC_MAX_WORDS];
+	uECC_word_t tmp2[uECC_MAX_WORDS];
+	uECC_word_t *k2[2] = {tmp, tmp2};
+	uECC_word_t carry;
+
+#if uECC_VLI_NATIVE_LITTLE_ENDIAN
+    uECC_word_t *_public = (uECC_word_t *)public_key;
+#else
+    uECC_word_t _public[uECC_MAX_WORDS * 2];
+#endif    
+    uECC_word_t r[uECC_MAX_WORDS], s[uECC_MAX_WORDS];
+    uECC_word_t e[uECC_MAX_WORDS], t[uECC_MAX_WORDS];
+	uECC_word_t p1[2*uECC_MAX_WORDS];
+	uECC_word_t p2[2*uECC_MAX_WORDS];
+    wordcount_t num_words = curve->num_words;
+    wordcount_t num_n_words = BITS_TO_WORDS(curve->num_n_bits);
+	
+	uint8_t test_e[256];
+	uint8_t test_Px[256];
+	uint8_t test_Py[256];
+
+    rx[num_n_words - 1] = 0;
+    r[num_n_words - 1] = 0;
+    s[num_n_words - 1] = 0;
+
+#if uECC_VLI_NATIVE_LITTLE_ENDIAN
+    bcopy((uint8_t *) r, signature, curve->num_bytes);
+    bcopy((uint8_t *) s, signature + curve->num_bytes, curve->num_bytes);
+#else
+    uECC_vli_bytesToNative(_public, public_key, curve->num_bytes);
+    uECC_vli_bytesToNative(
+        _public + num_words, public_key + curve->num_bytes, curve->num_bytes);
+    uECC_vli_bytesToNative(r, signature, curve->num_bytes);
+    uECC_vli_bytesToNative(s, signature + curve->num_bytes, curve->num_bytes);
+#endif
+
+	//B1：检验r′ ∈[1,n-1]是否成立，若不成立则验证不通过；
+	//B2：检验s′ ∈[1,n-1]是否成立，若不成立则验证不通过；
+    /* r, s must not be 0. */
+    if (uECC_vli_isZero(r, num_words) || uECC_vli_isZero(s, num_words)) {
+        return 0;
+    }
+
+    /* r, s must be < n. */
+    if (uECC_vli_cmp_unsafe(curve->n, r, num_n_words) != 1 ||
+            uECC_vli_cmp_unsafe(curve->n, s, num_n_words) != 1) {
+        return 0;
+    }
+
+	//B4：计算e 
+	bits2int(e, message_hash, hash_size, curve);
+
+#ifdef SM2_TEST_DATA
+	hexstr_to_bytes(test_e,"B524F552 CD82B8B0 28476E00 5C377FB1 9A87E6FC 682D48BB 5D42E3D9 B9EFFE76");
+	hexstr_to_bytes(test_Px,"0AE4C779 8AA0F119 471BEE11 825BE462 02BB79E2 A5844495 E97C04FF 4DF2548A");
+	hexstr_to_bytes(test_Py,"7C0240F8 8F1CD4E1 6352A73C 17B7F16F 07353E53 A176D684 A9FE0C6B B798E857");
+ 	uECC_vli_bytesToNative(e, test_e, BITS_TO_BYTES(curve->num_n_bits)); 
+ 	uECC_vli_bytesToNative(_public, test_Px, BITS_TO_BYTES(curve->num_n_bits)); 
+ 	uECC_vli_bytesToNative(_public+num_n_words, test_Py, BITS_TO_BYTES(curve->num_n_bits)); 
+#endif
+
+	//B5：将r′、s′的数据类型转换为整数，计算t = (r′ + s′) mod n 若t = 0，则验证不通过；
+	uECC_vli_modAdd(t, r, s, curve->n, num_n_words);
+    if (uECC_vli_isZero(t, num_words)) {
+        return 0;
+    }
+
+	//B6：计算椭圆曲线点(x,y) =[s′]G + [t]P
+	carry = regularize_k(s, tmp, tmp2, curve);
+	EccPoint_mult(p1, curve->G, k2[!carry], 0, curve->num_n_bits + 1, curve);
+
+	carry = regularize_k(t, tmp, tmp2, curve);
+	EccPoint_mult(p2, _public , k2[!carry], 0, curve->num_n_bits + 1, curve);
+
+	//计算p1+p2
+	SM2_Point_Add(sum, p1,p2,curve);
+
+	//B7: 计算R = (e′ + x′) modn
+	uECC_vli_modAdd(rx, e, sum, curve->n, num_n_words);
+
+    /* Accept only if v == r. */
+    return (int)(uECC_vli_equal(rx, r, num_words));
+}
+#endif /* uECC_SUPPORTS_SM2 */
+

@@ -8,6 +8,7 @@
 #define num_bytes_secp224r1 28
 #define num_bytes_secp256r1 32
 #define num_bytes_secp256k1 32
+#define num_bytes_SM2 32
 
 #if (uECC_WORD_SIZE == 1)
 
@@ -16,6 +17,7 @@
 #define num_words_secp224r1 28
 #define num_words_secp256r1 32
 #define num_words_secp256k1 32
+#define num_words_SM2 32
 
 #define BYTES_TO_WORDS_8(a, b, c, d, e, f, g, h) \
     0x##a, 0x##b, 0x##c, 0x##d, 0x##e, 0x##f, 0x##g, 0x##h
@@ -28,6 +30,7 @@
 #define num_words_secp224r1 7
 #define num_words_secp256r1 8
 #define num_words_secp256k1 8
+#define num_words_SM2 8
 
 #define BYTES_TO_WORDS_8(a, b, c, d, e, f, g, h) 0x##d##c##b##a, 0x##h##g##f##e
 #define BYTES_TO_WORDS_4(a, b, c, d) 0x##d##c##b##a
@@ -39,6 +42,7 @@
 #define num_words_secp224r1 4
 #define num_words_secp256r1 4
 #define num_words_secp256k1 4
+#define num_words_SM2 4
 
 #define BYTES_TO_WORDS_8(a, b, c, d, e, f, g, h) 0x##h##g##f##e##d##c##b##a##ull
 #define BYTES_TO_WORDS_4(a, b, c, d) 0x##d##c##b##a##ull
@@ -108,7 +112,7 @@ static void x_side_default(uECC_word_t *result, const uECC_word_t *x, uECC_Curve
 
 #if uECC_SUPPORT_COMPRESSED_POINT
 #if uECC_SUPPORTS_secp160r1 || uECC_SUPPORTS_secp192r1 || \
-    uECC_SUPPORTS_secp256r1 || uECC_SUPPORTS_secp256k1
+    uECC_SUPPORTS_secp256r1 || uECC_SUPPORTS_secp256k1 || uECC_SUPPORTS_SM2
 /* Compute a = sqrt(a) (mod curve_p). */
 static void mod_sqrt_default(uECC_word_t *a, uECC_Curve curve) {
     bitcount_t i;
@@ -1244,5 +1248,180 @@ static void omega_mult_secp256k1(uint64_t * result, const uint64_t * right) {
 #endif /* (uECC_OPTIMIZATION_LEVEL > 0 &&  && !asm_mmod_fast_secp256k1) */
 
 #endif /* uECC_SUPPORTS_secp256k1 */
+
+
+#if uECC_SUPPORTS_SM2
+
+//#define SM2_TEST_CURVE
+//#define SM2_TEST_DATA
+
+#if (uECC_OPTIMIZATION_LEVEL > 0)
+static void vli_mmod_fast_SM2(uECC_word_t *result, uECC_word_t *product);
+#endif
+
+#ifndef SM2_TEST_CURVE
+uECC_word_t _uECC_SM2_curve_a[uECC_MAX_WORDS]=
+	{ BYTES_TO_WORDS_8(FC, FF, FF, FF, FF, FF, FF, FF),
+        BYTES_TO_WORDS_8(00, 00, 00, 00, FF, FF, FF, FF),
+        BYTES_TO_WORDS_8(FF, FF, FF, FF, FF, FF, FF, FF),
+        BYTES_TO_WORDS_8(FF, FF, FF, FF, FE, FF, FF, FF) }; //a
+#else
+uECC_word_t _uECC_SM2_curve_a[uECC_MAX_WORDS]= 	
+{ BYTES_TO_WORDS_8(98, e4, 37, 39, 8b, 22, 65, ec),
+        BYTES_TO_WORDS_8(e0, d7, 31, 68, 8b, 84, 3c, 2f),
+        BYTES_TO_WORDS_8(ff, fe, bb, 73, 2e, 84, 17, 24),
+        BYTES_TO_WORDS_8(fd, c3, 32, fa, b4, 68, 79, 78) }; //SM2签名例子 a
+#endif
+
+static void double_jacobian_SM2(uECC_word_t * X1,
+                                    uECC_word_t * Y1,
+                                    uECC_word_t * Z1,
+                                    uECC_Curve curve) {
+	/* t1 = X, t2 = Y, t3 = Z */
+    uECC_word_t t4[num_words_SM2];
+    uECC_word_t t5[num_words_SM2];
+    uECC_word_t t6[num_words_SM2];
+
+    if (uECC_vli_isZero(Z1, num_words_SM2)) {
+        return;
+    }
+
+    uECC_vli_modSquare_fast(t4, X1, curve);   /* t4 = x1^2 */
+    uECC_vli_modSquare_fast(t5, Y1, curve); /* t5 = y1^2 */
+    uECC_vli_modMult_fast(X1, X1, t5, curve); /* t1 =  x1*y1^2 = A */
+    uECC_vli_modSquare_fast(t5, t5, curve); /* t5 = y1^4 */
+    uECC_vli_modSquare_fast(t6, Z1, curve); /* t6 = z1^2 */
+    uECC_vli_modSquare_fast(t6, t6, curve); /* t6 = z1^4 */
+    uECC_vli_modMult_fast(Z1, Y1, Z1, curve); /* t3 =  y1*z1 = z3 */
+    uECC_vli_modAdd(Y1, t4, t4, curve->p, num_words_SM2); /* t2 = 2*x1^2 */
+    uECC_vli_modAdd(t4, t4, Y1, curve->p, num_words_SM2); /* t2 = 3*x1^2 */
+    uECC_vli_modMult_fast(t6, _uECC_SM2_curve_a, t6, curve); /* t6 =  a*z1^4 */
+    uECC_vli_modAdd(t4, t4, t6, curve->p, num_words_SM2); /* t4 = 3*x1^2 + a*z1^4 */
+
+    if (uECC_vli_testBit(t4, 0)) {
+        uECC_word_t carry = uECC_vli_add(t4, t4, curve->p, num_words_SM2);
+        uECC_vli_rshift1(t4, num_words_SM2);
+        t4[num_words_SM2 - 1] |= carry << (uECC_WORD_BITS - 1);
+    } else {
+        uECC_vli_rshift1(t4, num_words_SM2);
+    }
+    /* t4 = 1/2*(3*x1^2 + a*z1^4) = B */
+
+    uECC_vli_modSquare_fast(t6, t4, curve);                     /* t6 = B^2 */
+    uECC_vli_modAdd(Y1, X1, X1, curve->p, num_words_SM2); /* t2 = 2A */ 
+    uECC_vli_modSub(t6, t6, Y1, curve->p, num_words_SM2); /* t1 = B^2 - 2A = x3 */    
+    uECC_vli_modSub(X1, X1, t6, curve->p, num_words_SM2); /* t4 = A - x3 */ 
+    uECC_vli_modMult_fast(t4, t4, X1, curve);                   /* t4 = B * (A - x3) */
+    uECC_vli_modSub(X1, t4, t5, curve->p, num_words_SM2); /* t2 = B * (A - x3) - y1^4 = y3 */
+
+    uECC_vli_set(Y1, X1, num_words_SM2);
+    uECC_vli_set(X1, t6, num_words_SM2);
+}
+
+/* Computes result = x^3 + ax + b. result must not overlap x. */
+static void x_side_SM2(uECC_word_t *result, const uECC_word_t *x, uECC_Curve curve) {
+    wordcount_t num_words = curve->num_words;
+ 
+    uECC_vli_modSquare_fast(result, x, curve);                             /* r = x^2 */
+    uECC_vli_modAdd(result, result, _uECC_SM2_curve_a, curve->p, num_words);       /* r = x^2 + a */
+    uECC_vli_modMult_fast(result, result, x, curve);                       /* r = x^3 + ax */
+    uECC_vli_modAdd(result, result, curve->b, curve->p, num_words); /* r = x^3 + ax + b */
+}
+
+#ifndef SM2_TEST_CURVE
+static const struct uECC_Curve_t curve_SM2 = {
+    num_words_SM2,
+    num_bytes_SM2,
+    256, // num_n_bits 
+    { BYTES_TO_WORDS_8(FF, FF, FF, FF, FF, FF, FF, FF),
+        BYTES_TO_WORDS_8(00, 00, 00, 00, FF, FF, FF, FF),
+        BYTES_TO_WORDS_8(FF, FF, FF, FF, FF, FF, FF, FF),
+        BYTES_TO_WORDS_8(FF, FF, FF, FF, FE, FF, FF, FF) }, //p
+    { BYTES_TO_WORDS_8(23, 41, D5, 39, 09, F4,  BB, 53),
+        BYTES_TO_WORDS_8(2B, 05, C6, 21, 6B, DF, 03, 72),
+        BYTES_TO_WORDS_8(FF, FF, FF, FF, FF, FF, FF, FF),
+        BYTES_TO_WORDS_8(FF, FF, FF, FF, FE, FF, FF, FF) },//n
+    { BYTES_TO_WORDS_8(C7, 74, 4C, 33, 89, 45, 5A, 71),
+        BYTES_TO_WORDS_8(E1, 0B, 66, F2, BF, 0B, E3, 8F),		  
+        BYTES_TO_WORDS_8(94, C9, 39, 6A, 46, 04, 99, 5F),
+        BYTES_TO_WORDS_8(19, 81, 19, 1F, 2C, AE, C4, 32), //Gx
+		    
+        BYTES_TO_WORDS_8(A0, F0, 39, 21, E5, 32, DF, 02),
+        BYTES_TO_WORDS_8(40, 47, 2A, C6, 7C, 87, A9, D0),	   
+        BYTES_TO_WORDS_8(53, 21, 69, 6B, E3, CE, BD, 59),
+        BYTES_TO_WORDS_8(9C, 77, F6, F4, A2, 36, 37, BC) },// Gy 	   
+    { BYTES_TO_WORDS_8(93, 0E, 94, 4D, 41, BD, BC, DD),
+        BYTES_TO_WORDS_8(92, 8F, AB, 15, F5, 89, 97, F3),
+		BYTES_TO_WORDS_8(A7, 09, 65, CF, 4B, 9E, 5A, 4D),
+        BYTES_TO_WORDS_8(34, 5E, 9F, 9D, 9E, FA, E9, 28) },// b 
+    &double_jacobian_SM2,
+#if uECC_SUPPORT_COMPRESSED_POINT
+    &mod_sqrt_default,
+#endif
+    &x_side_SM2,
+#if (uECC_OPTIMIZATION_LEVEL > 0)
+    &vli_mmod_fast_SM2			// 快速求余,每种算法不同
+#endif
+};
+#else
+//SM2签名例子
+static const struct uECC_Curve_t curve_SM2 = {
+    num_words_SM2,
+    num_bytes_SM2,
+    256, // num_n_bits 
+    { BYTES_TO_WORDS_8(c3, df, f1, 08, 8b, db, 2e, 72),
+        BYTES_TO_WORDS_8(7d, 51, 45, 5c, 91, 83, 72, 45),
+        BYTES_TO_WORDS_8(de, f7, 6f, bf, 35, 24, b9, e8),
+        BYTES_TO_WORDS_8(18, 4f, 04, 4c, 9e, d6, 42, 85) }, //p 
+
+    { BYTES_TO_WORDS_8(b7, 79, 2e, c3, e7, 4e,  e7, 5a),
+        BYTES_TO_WORDS_8(8d, 62, 85, 04, 63, 20, 77, 29),
+        BYTES_TO_WORDS_8(dd, f7, 6f, bf, 35, 24, b9, e8),
+        BYTES_TO_WORDS_8(18, 4f, 04, 4c, 9e, d6, 42, 85) },//n
+    { BYTES_TO_WORDS_8(3d, d4, ed, 7f, 14, 6c, 4e, 4c),
+        BYTES_TO_WORDS_8(dc, 0b, d5, ad, 3b, 0b, 22, 32),		  
+        BYTES_TO_WORDS_8(5e, 31, cc, c3, eb, 34, 64, 74),
+        BYTES_TO_WORDS_8(b6, ea, 62, 1b, d6, eb, 1d, 42), //Gx
+		    
+        BYTES_TO_WORDS_8(a2, 09, 6e, e4, b9, 41, 58, a8),
+        BYTES_TO_WORDS_8(a1, 6e, a3, bf, fc, fd, d7, e5),	   
+        BYTES_TO_WORDS_8(c4, 70, 3b, 15, d2, 49, 73, d4),
+        BYTES_TO_WORDS_8(07, 2c, b4, cb, 2b, 51, 80, 06) },// Gy 	   
+    { BYTES_TO_WORDS_8(9a, 24, c5, 27, da, d1, 12, 6e),
+        BYTES_TO_WORDS_8(6e, a0, 6b, b1, a5, 59, 1d, f6),
+		BYTES_TO_WORDS_8(48, fe, 4b, 48, 41, 42, f8, 9c),
+        BYTES_TO_WORDS_8(84, 0c, 3b, b2, d3, c6, e4, 63) },// b 
+    &double_jacobian_SM2,
+#if uECC_SUPPORT_COMPRESSED_POINT
+    &mod_sqrt_default,
+#endif
+    &x_side_SM2,
+#if (uECC_OPTIMIZATION_LEVEL > 0)
+    &vli_mmod_fast_SM2			// 快速求余,每种算法不同
+#endif
+};
+#endif /* SM2_TEST_CURVE */
+
+uECC_Curve uECC_SM2(void) { return &curve_SM2; }
+
+#if (uECC_OPTIMIZATION_LEVEL > 0 && !asm_mmod_fast_SM2)
+/* Computes result = product % curve_p
+   from http://www.nsa.gov/ia/_files/nist-routines.pdf */
+#if uECC_WORD_SIZE == 1
+static void vli_mmod_fast_SM2(uint8_t *result, uint8_t *product) {
+	uECC_vli_mmod(result, product, curve_SM2.p, num_words_SM2);
+}
+#elif uECC_WORD_SIZE == 4
+static void vli_mmod_fast_SM2(uint32_t *result, uint32_t *product) {
+	uECC_vli_mmod(result, product, curve_SM2.p, num_words_SM2);
+}
+#else
+static void vli_mmod_fast_SM2(uint64_t *result, uint64_t *product) {
+	uECC_vli_mmod(result, product, curve_SM2.p, num_words_SM2);
+}
+#endif /* uECC_WORD_SIZE */
+#endif /* (uECC_OPTIMIZATION_LEVEL > 0 && !asm_mmod_fast_SM2) */
+
+#endif /* uECC_SUPPORTS_SM2 */
 
 #endif /* _UECC_CURVE_SPECIFIC_H_ */
